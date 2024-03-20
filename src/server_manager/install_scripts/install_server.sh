@@ -129,7 +129,7 @@ function verify_docker_installed() {
     return 0
   fi
   log_error "NOT INSTALLED"
-  if ! confirm "Would you like to install Docker? This will run 'curl https://get.docker.com/ | sh'."; then
+  if ! confirm "Would you like to install Docker? This will run 'brew install docker'."; then
     exit 0
   fi
   if ! run_step "Installing Docker" install_docker; then
@@ -163,12 +163,12 @@ function install_docker() {
     # See https://github.com/Jigsaw-Code/outline-server/issues/951.
     # We do this in a subprocess so the umask for the calling process is unaffected.
     umask 0022
-    fetch https://get.docker.com/ | sh
+    brew install docker --cask
   ) >&2
 }
 
 function start_docker() {
-  systemctl enable --now docker.service >&2
+  open -a docker
 }
 
 function docker_container_exists() {
@@ -235,8 +235,13 @@ function get_random_port {
 
 function create_persisted_state_dir() {
   readonly STATE_DIR="${SHADOWBOX_DIR}/persisted-state"
-  mkdir -p "${STATE_DIR}"
-  chmod ug+rwx,g+s,o-rwx "${STATE_DIR}"
+  if [[ ! -d "${STATE_DIR}" ]]; then
+    mkdir -p "${STATE_DIR}" && STATE_DIR_CREATED=1 || STATE_DIR_CREATED=0
+  else
+    STATE_DIR_CREATED=0
+  fi
+  readonly STATE_DIR_CREATED
+  sudo chmod ug+rwx,g+s,o-rwx "${STATE_DIR}"
 }
 
 # Generate a secret key for access to the Management API and store it in a tag.
@@ -290,9 +295,7 @@ function join() {
 
 function write_config() {
   local -a config=()
-  if (( FLAGS_KEYS_PORT != 0 )); then
-    config+=("\"portForNewAccessKeys\": ${FLAGS_KEYS_PORT}")
-  fi
+  config+=("\"portForNewAccessKeys\": ${KEYS_PORT}")
   if [[ -n "${SB_DEFAULT_SERVER_NAME:-}" ]]; then
     config+=("\"name\": \"$(escape_json_string "${SB_DEFAULT_SERVER_NAME}")\"")   
   fi
@@ -319,7 +322,7 @@ docker_command=(
   docker
   run
   -d
-  --name "${CONTAINER_NAME}" --restart always --net host
+  --name "${CONTAINER_NAME}" --restart always 
 
   # Used by Watchtower to know which containers to monitor.
   --label 'com.centurylinklabs.watchtower.enable=true'
@@ -344,6 +347,9 @@ docker_command=(
   # Where to report metrics to, if opted-in.
   -e "SB_METRICS_URL=${SB_METRICS_URL:-}"
 
+  -p ${API_PORT}:${API_PORT}
+  -p ${KEYS_PORT}:${KEYS_PORT}
+
   # The Outline server image to run.
   "${SB_IMAGE}"
 )
@@ -355,11 +361,11 @@ EOF
   STDERR_OUTPUT="$({ "${START_SCRIPT}" >/dev/null; } 2>&1)" && return
   readonly STDERR_OUTPUT
   log_error "FAILED"
+  log_error "${STDERR_OUTPUT}"
   if docker_container_exists "${CONTAINER_NAME}"; then
     handle_docker_container_conflict "${CONTAINER_NAME}" true
     return
   else
-    log_error "${STDERR_OUTPUT}"
     return 1
   fi
 }
@@ -376,11 +382,11 @@ function start_watchtower() {
   STDERR_OUTPUT="$(docker run -d "${docker_watchtower_flags[@]}" containrrr/watchtower --cleanup --label-enable --tlsverify --interval "${WATCHTOWER_REFRESH_SECONDS}" 2>&1 >/dev/null)" && return
   readonly STDERR_OUTPUT
   log_error "FAILED"
+  log_error "${STDERR_OUTPUT}"
   if docker_container_exists watchtower; then
     handle_docker_container_conflict watchtower false
     return
   else
-    log_error "${STDERR_OUTPUT}"
     return 1
   fi
 }
@@ -453,10 +459,10 @@ function set_hostname() {
 install_shadowbox() {
   local MACHINE_TYPE
   MACHINE_TYPE="$(uname -m)"
-  if [[ "${MACHINE_TYPE}" != "x86_64" ]]; then
-    log_error "Unsupported machine type: ${MACHINE_TYPE}. Please run this script on a x86_64 machine"
-    exit 1
-  fi
+  # if [[ "${MACHINE_TYPE}" != "x86_64" ]]; then
+  #   log_error "Unsupported machine type: ${MACHINE_TYPE}. Please run this script on a x86_64 machine"
+  #   exit 1
+  # fi
 
   # Make sure we don't leak readable files to other users.
   umask 0007
@@ -468,7 +474,8 @@ install_shadowbox() {
 
   log_for_sentry "Creating Outline directory"
   export SHADOWBOX_DIR="${SHADOWBOX_DIR:-/opt/outline}"
-  mkdir -p "${SHADOWBOX_DIR}"
+  sudo mkdir -p "${SHADOWBOX_DIR}"
+  sudo chown "${USER}" "${SHADOWBOX_DIR}"
   chmod u+s,ug+rwx,o-rwx "${SHADOWBOX_DIR}"
 
   log_for_sentry "Setting API port"
@@ -479,6 +486,13 @@ install_shadowbox() {
   readonly API_PORT
   readonly ACCESS_CONFIG="${ACCESS_CONFIG:-${SHADOWBOX_DIR}/access.txt}"
   readonly SB_IMAGE="${SB_IMAGE:-quay.io/outline/shadowbox:stable}"
+
+  log_for_sentry "Setting keys port"
+  KEYS_PORT="${FLAGS_KEYS_PORT}"
+  if (( KEYS_PORT == 0 )); then
+    KEYS_PORT=$(get_random_port)
+  fi
+  readonly KEYS_PORT
 
   PUBLIC_HOSTNAME="${FLAGS_HOSTNAME:-${SB_PUBLIC_IP:-}}"
   if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
@@ -496,11 +510,13 @@ install_shadowbox() {
 
   # Make a directory for persistent state
   run_step "Creating persistent state dir" create_persisted_state_dir
+  [ "$STATE_DIR_CREATED" = "1" ] && read -p "> Action Required: Open Docker Desktop -> Settings -> Resources -> File Sharing, add '${STATE_DIR}' as a virtual file share, and hit 'Apply and restart'. Hit Enter to continue..."
   run_step "Generating secret key" generate_secret_key
   run_step "Generating TLS certificate" generate_certificate
   run_step "Generating SHA-256 certificate fingerprint" generate_certificate_fingerprint
   run_step "Writing config" write_config
 
+  [ "$(uname -m)" = "arm64" ] && read -p "> Action Required: For optimal performance on Apple Silicon: Open Docker Desktop -> Settings -> General and check 'Use Rosetta'. Hit Enter to continue..."
   # TODO(dborkan): if the script fails after docker run, it will continue to fail
   # as the names shadowbox and watchtower will already be in use.  Consider
   # deleting the container in the case of failure (e.g. using a trap, or
